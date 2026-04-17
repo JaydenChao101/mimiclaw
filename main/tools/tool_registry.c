@@ -3,8 +3,12 @@
 #include "tools/tool_web_search.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_files.h"
+#include "tools/tool_camera.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_water_pump.h"
+#include "tools/tool_adc.h"
+#include "tools/tool_soil_moisture.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -133,6 +137,23 @@ esp_err_t tool_registry_init(void)
     };
     register_tool(&ld);
 
+    mimi_tool_t cam = {
+        .name = "camera_send_photo",
+        .description = "Capture a JPEG photo from the XIAO ESP32S3 Sense camera and stream it directly to Telegram without saving it on ESP32 flash.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"chat_id\":{\"type\":\"string\",\"description\":\"Telegram chat ID\"},"
+            "\"caption\":{\"type\":\"string\",\"description\":\"Optional caption\"},"
+            "\"wb_mode\":{\"type\":\"integer\",\"description\":\"Optional white balance mode: 0 auto, 1 sunny, 2 cloudy, 3 office/fluorescent, 4 home/incandescent. Default 3 to reduce green tint indoors\"},"
+            "\"warmup_frames\":{\"type\":\"integer\",\"description\":\"Optional frames to discard before sending photo, 0-5. Default 2 so auto exposure/white balance can settle\"},"
+            "\"brightness\":{\"type\":\"integer\",\"description\":\"Optional brightness adjustment, -2 to 2. Default 0\"},"
+            "\"contrast\":{\"type\":\"integer\",\"description\":\"Optional contrast adjustment, -2 to 2. Default 0\"},"
+            "\"saturation\":{\"type\":\"integer\",\"description\":\"Optional saturation adjustment, -2 to 2. Default 0\"}},"
+            "\"required\":[\"chat_id\"]}",
+        .execute = tool_camera_send_photo_execute,
+    };
+    register_tool(&cam);
+
     /* Register cron_add */
     mimi_tool_t ca = {
         .name = "cron_add",
@@ -179,6 +200,7 @@ esp_err_t tool_registry_init(void)
 
     /* Register GPIO tools */
     tool_gpio_init();
+    tool_adc_init();
 
     mimi_tool_t gw = {
         .name = "gpio_write",
@@ -191,6 +213,19 @@ esp_err_t tool_registry_init(void)
         .execute = tool_gpio_write_execute,
     };
     register_tool(&gw);
+
+    mimi_tool_t wp = {
+        .name = "water_pump_control",
+        .description = "Turn the water pump relay on GPIO44 on or off. Defaults to active-low relay logic, so ON writes GPIO LOW and OFF writes GPIO HIGH. Use this instead of gpio_write for pumps.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"Optional GPIO pin connected to the water pump relay; default 44\"},"
+            "\"state\":{\"type\":\"string\",\"description\":\"'on' or 'off'\"},"
+            "\"active_low\":{\"type\":\"boolean\",\"description\":\"Optional relay polarity; default true\"}},"
+            "\"required\":[\"state\"]}",
+        .execute = tool_water_pump_control_execute,
+    };
+    register_tool(&wp);
 
     mimi_tool_t gr = {
         .name = "gpio_read",
@@ -213,6 +248,32 @@ esp_err_t tool_registry_init(void)
         .execute = tool_gpio_read_all_execute,
     };
     register_tool(&ga);
+
+    mimi_tool_t ar = {
+        .name = "adc_read",
+        .description = "Read an ADC-capable GPIO pin as an analog value. Use for analog sensors such as soil moisture sensors. Optional dry_raw and wet_raw calibrate a moisture percentage.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"description\":\"ADC-capable GPIO pin number\"},"
+            "\"dry_raw\":{\"type\":\"integer\",\"description\":\"Optional raw value measured in dry soil\"},"
+            "\"wet_raw\":{\"type\":\"integer\",\"description\":\"Optional raw value measured in water or wet soil\"}},"
+            "\"required\":[\"pin\"]}",
+        .execute = tool_adc_read_execute,
+    };
+    register_tool(&ar);
+
+    mimi_tool_t smr = {
+        .name = "soil_moisture_report",
+        .description = "Read the soil moisture sensor connected to GPIO7 on the ESP32-S3, explain the plant moisture level, and optionally send the report to Telegram.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"chat_id\":{\"type\":\"string\",\"description\":\"Optional Telegram chat ID to send the report to\"},"
+            "\"dry_raw\":{\"type\":\"integer\",\"description\":\"Optional calibration raw value measured in dry soil; default 3200\"},"
+            "\"wet_raw\":{\"type\":\"integer\",\"description\":\"Optional calibration raw value measured in wet soil; default 1200\"}},"
+            "\"required\":[]}",
+        .execute = tool_soil_moisture_report_execute,
+    };
+    register_tool(&smr);
 
     build_tools_json();
 

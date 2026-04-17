@@ -183,8 +183,8 @@ mimi> clear_proxy                    # 清除代理
 ```
 mimi> wifi_set MySSID MyPassword   # 换 WiFi
 mimi> set_tg_token 123456:ABC...   # 换 Telegram Bot Token
-mimi> set_api_key sk-ant-api03-... # 换 API Key（Anthropic 或 OpenAI）
-mimi> set_model_provider openai    # 切换提供商（anthropic|openai）
+mimi> set_api_key sk-ant-api03-... # 换 API Key（Anthropic、OpenAI 或 OpenRouter）
+mimi> set_model_provider openrouter # 切换提供商（anthropic|openai|openrouter）
 mimi> set_model gpt-4o             # 换模型
 mimi> set_proxy 192.168.1.83 7897  # 设置代理
 mimi> clear_proxy                  # 清除代理

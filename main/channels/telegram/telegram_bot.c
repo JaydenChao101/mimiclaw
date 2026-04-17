@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
@@ -34,6 +35,35 @@ typedef struct {
     size_t len;
     size_t cap;
 } http_resp_t;
+
+static int write_all_direct(esp_http_client_handle_t client, const char *data, size_t len)
+{
+    size_t written = 0;
+    while (written < len) {
+        int ret = esp_http_client_write(client, data + written, len - written);
+        if (ret <= 0) {
+            return -1;
+        }
+        written += (size_t)ret;
+    }
+    return 0;
+}
+
+static int write_all_proxy(proxy_conn_t *conn, const char *data, size_t len)
+{
+    size_t written = 0;
+    while (written < len) {
+        size_t chunk = len - written;
+        if (chunk > 4096) {
+            chunk = 4096;
+        }
+        if (proxy_conn_write(conn, data + written, (int)chunk) < 0) {
+            return -1;
+        }
+        written += chunk;
+    }
+    return 0;
+}
 
 static uint64_t fnv1a64(const char *s)
 {
@@ -547,6 +577,263 @@ esp_err_t telegram_send_message(const char *chat_id, const char *text)
     }
 
     return all_ok ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t telegram_send_photo_jpeg_direct(const char *chat_id,
+                                                 const uint8_t *jpeg,
+                                                 size_t jpeg_len,
+                                                 const char *caption,
+                                                 const char *boundary)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendPhoto", s_bot_token);
+
+    char chat_part[128];
+    int chat_len = snprintf(chat_part, sizeof(chat_part),
+                            "--%s\r\n"
+                            "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+                            "%s\r\n",
+                            boundary, chat_id);
+
+    char caption_part[512] = {0};
+    int caption_len = 0;
+    if (caption && caption[0]) {
+        caption_len = snprintf(caption_part, sizeof(caption_part),
+                               "--%s\r\n"
+                               "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
+                               "%s\r\n",
+                               boundary, caption);
+    }
+
+    char photo_header[256];
+    int photo_header_len = snprintf(photo_header, sizeof(photo_header),
+                                    "--%s\r\n"
+                                    "Content-Disposition: form-data; name=\"photo\"; filename=\"capture.jpg\"\r\n"
+                                    "Content-Type: image/jpeg\r\n\r\n",
+                                    boundary);
+    char photo_tail[96];
+    int photo_tail_len = snprintf(photo_tail, sizeof(photo_tail),
+                                  "\r\n--%s--\r\n", boundary);
+
+    if (chat_len < 0 || caption_len < 0 || photo_header_len < 0 || photo_tail_len < 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    int64_t content_len = (int64_t)chat_len + caption_len + photo_header_len +
+                          (int64_t)jpeg_len + photo_tail_len;
+
+    char content_type[96];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+
+    http_resp_t resp = {
+        .buf = calloc(1, 2048),
+        .len = 0,
+        .cap = 2048,
+    };
+    if (!resp.buf) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_http_client_config_t config = {
+        .url = url,
+        .event_handler = http_event_handler,
+        .user_data = &resp,
+        .timeout_ms = 30000,
+        .buffer_size = 2048,
+        .buffer_size_tx = 2048,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(resp.buf);
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_method(client, HTTP_METHOD_POST);
+    esp_http_client_set_header(client, "Content-Type", content_type);
+
+    esp_err_t err = esp_http_client_open(client, content_len);
+    if (err == ESP_OK &&
+        (write_all_direct(client, chat_part, chat_len) < 0 ||
+         (caption_len > 0 && write_all_direct(client, caption_part, caption_len) < 0) ||
+         write_all_direct(client, photo_header, photo_header_len) < 0 ||
+         write_all_direct(client, (const char *)jpeg, jpeg_len) < 0 ||
+         write_all_direct(client, photo_tail, photo_tail_len) < 0)) {
+        err = ESP_FAIL;
+    }
+
+    if (err == ESP_OK) {
+        int headers = esp_http_client_fetch_headers(client);
+        if (headers >= 0) {
+            char tmp[512];
+            while (1) {
+                int n = esp_http_client_read(client, tmp, sizeof(tmp));
+                if (n <= 0) break;
+                http_resp_t evt_resp = resp;
+                if (evt_resp.len + (size_t)n + 1 > evt_resp.cap) {
+                    size_t new_cap = evt_resp.cap * 2;
+                    if (new_cap < evt_resp.len + (size_t)n + 1) {
+                        new_cap = evt_resp.len + (size_t)n + 1;
+                    }
+                    char *grown = realloc(resp.buf, new_cap);
+                    if (!grown) {
+                        err = ESP_ERR_NO_MEM;
+                        break;
+                    }
+                    resp.buf = grown;
+                    resp.cap = new_cap;
+                }
+                memcpy(resp.buf + resp.len, tmp, n);
+                resp.len += (size_t)n;
+                resp.buf[resp.len] = '\0';
+            }
+        }
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    if (err == ESP_OK) {
+        const char *desc = NULL;
+        if (!tg_response_is_ok(resp.buf, &desc)) {
+            ESP_LOGE(TAG, "Telegram photo upload failed: %s", desc ? desc : "unknown");
+            ESP_LOGE(TAG, "Telegram raw response: %.300s", resp.buf ? resp.buf : "");
+            err = ESP_FAIL;
+        }
+    }
+
+    free(resp.buf);
+    return err;
+}
+
+static esp_err_t telegram_send_photo_jpeg_via_proxy(const char *chat_id,
+                                                    const uint8_t *jpeg,
+                                                    size_t jpeg_len,
+                                                    const char *caption,
+                                                    const char *boundary)
+{
+    proxy_conn_t *conn = proxy_conn_open("api.telegram.org", 443, 30000);
+    if (!conn) {
+        return ESP_ERR_HTTP_CONNECT;
+    }
+
+    char chat_part[128];
+    int chat_len = snprintf(chat_part, sizeof(chat_part),
+                            "--%s\r\n"
+                            "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n"
+                            "%s\r\n",
+                            boundary, chat_id);
+    char caption_part[512] = {0};
+    int caption_len = 0;
+    if (caption && caption[0]) {
+        caption_len = snprintf(caption_part, sizeof(caption_part),
+                               "--%s\r\n"
+                               "Content-Disposition: form-data; name=\"caption\"\r\n\r\n"
+                               "%s\r\n",
+                               boundary, caption);
+    }
+    char photo_header[256];
+    int photo_header_len = snprintf(photo_header, sizeof(photo_header),
+                                    "--%s\r\n"
+                                    "Content-Disposition: form-data; name=\"photo\"; filename=\"capture.jpg\"\r\n"
+                                    "Content-Type: image/jpeg\r\n\r\n",
+                                    boundary);
+    char photo_tail[96];
+    int photo_tail_len = snprintf(photo_tail, sizeof(photo_tail),
+                                  "\r\n--%s--\r\n", boundary);
+    if (chat_len < 0 || caption_len < 0 || photo_header_len < 0 || photo_tail_len < 0) {
+        proxy_conn_close(conn);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    int64_t content_len = (int64_t)chat_len + caption_len + photo_header_len +
+                          (int64_t)jpeg_len + photo_tail_len;
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+        "POST /bot%s/sendPhoto HTTP/1.1\r\n"
+        "Host: api.telegram.org\r\n"
+        "Content-Type: multipart/form-data; boundary=%s\r\n"
+        "Content-Length: %lld\r\n"
+        "Connection: close\r\n\r\n",
+        s_bot_token, boundary, (long long)content_len);
+    if (header_len < 0 || header_len >= (int)sizeof(header)) {
+        proxy_conn_close(conn);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t err = ESP_OK;
+    if (write_all_proxy(conn, header, header_len) < 0 ||
+        write_all_proxy(conn, chat_part, chat_len) < 0 ||
+        (caption_len > 0 && write_all_proxy(conn, caption_part, caption_len) < 0) ||
+        write_all_proxy(conn, photo_header, photo_header_len) < 0 ||
+        write_all_proxy(conn, (const char *)jpeg, jpeg_len) < 0 ||
+        write_all_proxy(conn, photo_tail, photo_tail_len) < 0) {
+        err = ESP_FAIL;
+    }
+
+    char *resp = NULL;
+    if (err == ESP_OK) {
+        size_t cap = 4096, len = 0;
+        resp = calloc(1, cap);
+        if (!resp) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            while (1) {
+                if (len + 1024 >= cap) {
+                    cap *= 2;
+                    char *grown = realloc(resp, cap);
+                    if (!grown) {
+                        err = ESP_ERR_NO_MEM;
+                        break;
+                    }
+                    resp = grown;
+                }
+                int n = proxy_conn_read(conn, resp + len, cap - len - 1, 30000);
+                if (n <= 0) break;
+                len += (size_t)n;
+                resp[len] = '\0';
+            }
+        }
+    }
+
+    proxy_conn_close(conn);
+
+    if (err == ESP_OK) {
+        char *body = resp ? strstr(resp, "\r\n\r\n") : NULL;
+        body = body ? body + 4 : resp;
+        const char *desc = NULL;
+        if (!tg_response_is_ok(body, &desc)) {
+            ESP_LOGE(TAG, "Telegram photo upload failed: %s", desc ? desc : "unknown");
+            ESP_LOGE(TAG, "Telegram raw response: %.300s", body ? body : "");
+            err = ESP_FAIL;
+        }
+    }
+    free(resp);
+    return err;
+}
+
+esp_err_t telegram_send_photo_jpeg(const char *chat_id,
+                                   const uint8_t *jpeg,
+                                   size_t jpeg_len,
+                                   const char *caption)
+{
+    if (s_bot_token[0] == '\0') {
+        ESP_LOGW(TAG, "Cannot send photo: no bot token");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!chat_id || !chat_id[0] || !jpeg || jpeg_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *boundary = "----MimiClawBoundary7MA4YWxkTrZu0gW";
+    ESP_LOGI(TAG, "Uploading JPEG photo to Telegram chat %s (%d bytes)",
+             chat_id, (int)jpeg_len);
+
+    if (http_proxy_is_enabled()) {
+        return telegram_send_photo_jpeg_via_proxy(chat_id, jpeg, jpeg_len, caption, boundary);
+    }
+    return telegram_send_photo_jpeg_direct(chat_id, jpeg, jpeg_len, caption, boundary);
 }
 
 esp_err_t telegram_set_token(const char *token)

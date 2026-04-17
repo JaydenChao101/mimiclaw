@@ -168,8 +168,8 @@ idf.py -p PORT flash monitor
 ```
 mimi> wifi_set MySSID MyPassword   # WiFiネットワークを変更
 mimi> set_tg_token 123456:ABC...   # Telegram Botトークンを変更
-mimi> set_api_key sk-ant-api03-... # APIキーを変更（AnthropicまたはOpenAI）
-mimi> set_model_provider openai    # プロバイダーを切替（anthropic|openai）
+mimi> set_api_key sk-ant-api03-... # APIキーを変更（Anthropic、OpenAI、OpenRouter）
+mimi> set_model_provider openrouter # プロバイダーを切替（anthropic|openai|openrouter）
 mimi> set_model gpt-4o             # LLMモデルを変更
 mimi> set_proxy 127.0.0.1 7897    # HTTPプロキシを設定
 mimi> clear_proxy                  # プロキシを削除

@@ -14,7 +14,7 @@
 static const char *TAG = "llm";
 
 #define LLM_API_KEY_MAX_LEN 320
-#define LLM_MODEL_MAX_LEN   64
+#define LLM_MODEL_MAX_LEN   128
 #define LLM_DUMP_MAX_BYTES   (16 * 1024)
 #define LLM_DUMP_CHUNK_BYTES 320
 
@@ -187,18 +187,37 @@ static bool provider_is_openai(void)
     return strcmp(s_provider, "openai") == 0;
 }
 
+static bool provider_is_openrouter(void)
+{
+    return strcmp(s_provider, "openrouter") == 0;
+}
+
+static bool provider_is_openai_compatible(void)
+{
+    return provider_is_openai() || provider_is_openrouter();
+}
+
 static const char *llm_api_url(void)
 {
+    if (provider_is_openrouter()) {
+        return MIMI_OPENROUTER_API_URL;
+    }
     return provider_is_openai() ? MIMI_OPENAI_API_URL : MIMI_LLM_API_URL;
 }
 
 static const char *llm_api_host(void)
 {
+    if (provider_is_openrouter()) {
+        return "openrouter.ai";
+    }
     return provider_is_openai() ? "api.openai.com" : "api.anthropic.com";
 }
 
 static const char *llm_api_path(void)
 {
+    if (provider_is_openrouter()) {
+        return "/api/v1/chat/completions";
+    }
     return provider_is_openai() ? "/v1/chat/completions" : "/v1/messages";
 }
 
@@ -265,11 +284,19 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", "application/json");
-    if (provider_is_openai()) {
+    if (provider_is_openai_compatible()) {
         if (s_api_key[0]) {
             char auth[LLM_API_KEY_MAX_LEN + 16];
             snprintf(auth, sizeof(auth), "Bearer %s", s_api_key);
             esp_http_client_set_header(client, "Authorization", auth);
+        }
+        if (provider_is_openrouter()) {
+            if (MIMI_OPENROUTER_HTTP_REFERER[0]) {
+                esp_http_client_set_header(client, "HTTP-Referer", MIMI_OPENROUTER_HTTP_REFERER);
+            }
+            if (MIMI_OPENROUTER_X_TITLE[0]) {
+                esp_http_client_set_header(client, "X-Title", MIMI_OPENROUTER_X_TITLE);
+            }
         }
     } else {
         esp_http_client_set_header(client, "x-api-key", s_api_key);
@@ -293,15 +320,38 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
     int body_len = strlen(post_data);
     char header[1024];
     int hlen = 0;
-    if (provider_is_openai()) {
-        hlen = snprintf(header, sizeof(header),
-            "POST %s HTTP/1.1\r\n"
-            "Host: %s\r\n"
-            "Content-Type: application/json\r\n"
-            "Authorization: Bearer %s\r\n"
-            "Content-Length: %d\r\n"
-            "Connection: close\r\n\r\n",
-            llm_api_path(), llm_api_host(), s_api_key, body_len);
+    if (provider_is_openai_compatible()) {
+        if (provider_is_openrouter()) {
+            hlen = snprintf(header, sizeof(header),
+                "POST %s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Authorization: Bearer %s\r\n",
+                llm_api_path(), llm_api_host(), s_api_key);
+            if (hlen > 0 && hlen < (int)sizeof(header) && MIMI_OPENROUTER_HTTP_REFERER[0]) {
+                hlen += snprintf(header + hlen, sizeof(header) - hlen,
+                    "HTTP-Referer: %s\r\n", MIMI_OPENROUTER_HTTP_REFERER);
+            }
+            if (hlen > 0 && hlen < (int)sizeof(header) && MIMI_OPENROUTER_X_TITLE[0]) {
+                hlen += snprintf(header + hlen, sizeof(header) - hlen,
+                    "X-Title: %s\r\n", MIMI_OPENROUTER_X_TITLE);
+            }
+            if (hlen > 0 && hlen < (int)sizeof(header)) {
+                hlen += snprintf(header + hlen, sizeof(header) - hlen,
+                    "Content-Length: %d\r\n"
+                    "Connection: close\r\n\r\n",
+                    body_len);
+            }
+        } else {
+            hlen = snprintf(header, sizeof(header),
+                "POST %s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "Authorization: Bearer %s\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n\r\n",
+                llm_api_path(), llm_api_host(), s_api_key, body_len);
+        }
     } else {
         hlen = snprintf(header, sizeof(header),
             "POST %s HTTP/1.1\r\n"
@@ -312,6 +362,11 @@ static esp_err_t llm_http_via_proxy(const char *post_data, resp_buf_t *rb, int *
             "Content-Length: %d\r\n"
             "Connection: close\r\n\r\n",
             llm_api_path(), llm_api_host(), s_api_key, MIMI_LLM_API_VERSION, body_len);
+    }
+
+    if (hlen <= 0 || hlen >= (int)sizeof(header)) {
+        proxy_conn_close(conn);
+        return ESP_ERR_NO_MEM;
     }
 
     if (proxy_conn_write(conn, header, hlen) < 0 ||
@@ -565,7 +620,7 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         cJSON_AddNumberToObject(body, "max_tokens", MIMI_LLM_MAX_TOKENS);
     }
 
-    if (provider_is_openai()) {
+    if (provider_is_openai_compatible()) {
         cJSON *openai_msgs = convert_messages_openai(system_prompt, messages);
         cJSON_AddItemToObject(body, "messages", openai_msgs);
 
@@ -635,7 +690,7 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         return ESP_FAIL;
     }
 
-    if (provider_is_openai()) {
+    if (provider_is_openai_compatible()) {
         cJSON *choices = cJSON_GetObjectItem(root, "choices");
         cJSON *choice0 = choices && cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
         if (choice0) {

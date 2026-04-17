@@ -1,6 +1,8 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stddef.h>
+#include <stdint.h>
 
 /**
  * Initialize the Telegram bot.
@@ -21,7 +23,15 @@ esp_err_t telegram_bot_start(void);
 esp_err_t telegram_send_message(const char *chat_id, const char *text);
 
 /**
+ * Send JPEG bytes to a Telegram chat as a photo.
+ * The image is streamed from RAM over HTTPS and is not written to flash.
+ */
+esp_err_t telegram_send_photo_jpeg(const char *chat_id,
+                                   const uint8_t *jpeg,
+                                   size_t jpeg_len,
+                                   const char *caption);
+
+/**
  * Save the Telegram bot token to NVS.
  */
 esp_err_t telegram_set_token(const char *token);
-
